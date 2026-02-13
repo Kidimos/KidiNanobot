@@ -28,7 +28,7 @@ def get_workspace_path(workspace: str | None = None) -> Path:
     if workspace:
         path = Path(workspace).expanduser()
     else:
-        path = Path.home() / ".nanobot" / "workspace"
+        path = Path.home() / ".kidi" / "workspace"
     return ensure_dir(path)
 
 
