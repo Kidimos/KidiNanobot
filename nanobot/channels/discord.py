@@ -9,11 +9,12 @@ import httpx
 import websockets
 from loguru import logger
 
+# 暂时注释掉这一块
+# from websockets.legacy.client import WebSocketClientProtocol
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import DiscordConfig
-
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20MB
@@ -27,7 +28,7 @@ class DiscordChannel(BaseChannel):
     def __init__(self, config: DiscordConfig, bus: MessageBus):
         super().__init__(config, bus)
         self.config: DiscordConfig = config
-        self._ws: websockets.WebSocketClientProtocol | None = None
+        self._ws: websockets.ClientConnection | None = None
         self._seq: int | None = None
         self._heartbeat_task: asyncio.Task | None = None
         self._typing_tasks: dict[str, asyncio.Task] = {}
@@ -78,6 +79,13 @@ class DiscordChannel(BaseChannel):
             logger.warning("Discord HTTP client not initialized")
             return
 
+        # 1.发送前验证消息内容
+        if not msg.content:
+            logger.error("Attempted to send empty message to Discord")
+            return
+        if len(msg.content) > 2000:
+            logger.error("Message exceeds Discord 2000 character limit: {len(msg.content)}")
+
         url = f"{DISCORD_API_BASE}/channels/{msg.chat_id}/messages"
         payload: dict[str, Any] = {"content": msg.content}
 
@@ -86,6 +94,9 @@ class DiscordChannel(BaseChannel):
             payload["allowed_mentions"] = {"replied_user": False}
 
         headers = {"Authorization": f"Bot {self.config.token}"}
+
+        # 2.调试日志：记录实际发送的payload（生产环境可以设置为DEBUG级别）
+        logger.debug(f"Sending to Discord: {json.dumps(payload)}")
 
         try:
             for attempt in range(3):
@@ -212,7 +223,9 @@ class DiscordChannel(BaseChannel):
                 continue
             try:
                 media_dir.mkdir(parents=True, exist_ok=True)
-                file_path = media_dir / f"{attachment.get('id', 'file')}_{filename.replace('/', '_')}"
+                file_path = (
+                    media_dir / f"{attachment.get('id', 'file')}_{filename.replace('/', '_')}"
+                )
                 resp = await self._http.get(url)
                 resp.raise_for_status()
                 file_path.write_bytes(resp.content)
