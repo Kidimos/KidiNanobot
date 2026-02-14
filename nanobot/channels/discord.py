@@ -9,8 +9,6 @@ import httpx
 import websockets
 from loguru import logger
 
-# 暂时注释掉这一块
-# from websockets.legacy.client import WebSocketClientProtocol
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
