@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -82,39 +83,42 @@ class DiscordChannel(BaseChannel):
             logger.error("Attempted to send empty message to Discord")
             return
         if len(msg.content) > 2000:
-            logger.error("Message exceeds Discord 2000 character limit: {len(msg.content)}")
+            logger.debug("Message exceeds Discord 2000 character limit: {len(msg.content)}")
 
-        url = f"{DISCORD_API_BASE}/channels/{msg.chat_id}/messages"
-        payload: dict[str, Any] = {"content": msg.content}
+        chunks = self._split_message(msg.content)
+        logger.debug("Splitting messages into {len(chunks)} chunks")
 
-        if msg.reply_to:
-            payload["message_reference"] = {"message_id": msg.reply_to}
-            payload["allowed_mentions"] = {"replied_user": False}
+        for i, chunk in enumerate(chunks):
+            payload: dict[str, Any] = {"content": chunk}
+            if i == 0 and msg.reply_to:
+                payload["message_reference"] = {"message_id": msg.reply_to}
+                payload["allowed_mentions"] = {"replied_user": False}
 
-        headers = {"Authorization": f"Bot {self.config.token}"}
+            headers = {"Authorization": f"Bot {self.config.token}"}
+            url = f"{DISCORD_API_BASE}/channels/{msg.chat_id}/messages"
 
-        # 2.调试日志：记录实际发送的payload（生产环境可以设置为DEBUG级别）
-        logger.debug(f"Sending to Discord: {json.dumps(payload)}")
+            logger.debug(f"Sending chunk {i + 1}/{len(chunks)} to Discord: {json.dumps(payload)}")
 
-        try:
-            for attempt in range(3):
-                try:
-                    response = await self._http.post(url, headers=headers, json=payload)
-                    if response.status_code == 429:
-                        data = response.json()
-                        retry_after = float(data.get("retry_after", 1.0))
-                        logger.warning(f"Discord rate limited, retrying in {retry_after}s")
-                        await asyncio.sleep(retry_after)
-                        continue
-                    response.raise_for_status()
-                    return
-                except Exception as e:
-                    if attempt == 2:
-                        logger.error(f"Error sending Discord message: {e}")
-                    else:
-                        await asyncio.sleep(1)
-        finally:
-            await self._stop_typing(msg.chat_id)
+            try:
+                for attempt in range(3):
+                    try:
+                        response = await self._http.post(url, headers=headers, json=payload)
+                        if response.status_code == 429:
+                            data = response.json()
+                            retry_after = float(data.get("retry_after", 1.0))
+                            logger.warning(f"Discord rate limited, retrying in {retry_after}s")
+                            await asyncio.sleep(retry_after)
+                            continue
+                        response.raise_for_status()
+                        break
+                    except Exception as e:
+                        if attempt == 2:
+                            logger.error(f"Error sending Discord message chunk{i + 1}: {e}")
+                        else:
+                            await asyncio.sleep(1)
+            finally:
+                if i == len(chunks) - 1:
+                    await self._stop_typing(msg.chat_id)
 
     async def _gateway_loop(self) -> None:
         """Main gateway loop: identify, heartbeat, dispatch events."""
@@ -258,6 +262,10 @@ class DiscordChannel(BaseChannel):
             headers = {"Authorization": f"Bot {self.config.token}"}
             while self._running:
                 try:
+                    if not self._http:
+                        logger.warning("HTTP client unaviilable, stopping typing loop")
+                        break
+
                     await self._http.post(url, headers=headers)
                 except Exception:
                     pass
@@ -270,3 +278,174 @@ class DiscordChannel(BaseChannel):
         task = self._typing_tasks.pop(channel_id, None)
         if task:
             task.cancel()
+
+    def _split_message(self, text: str, max_length: int = 2000) -> list[str]:
+        """Split a long message into chunks, preserving code blocks as much as possible."""
+        if len(text) <= max_length:
+            return [text]
+
+        # Step 1: Find all code block ranges
+        code_block_ranges = []
+        pattern = re.compile(r"```(?:\w*)\n(.*?)```", re.DOTALL)
+        pos = 0
+        while True:
+            match = pattern.search(text, pos)
+            if not match:
+                break
+            start, end = match.start(), match.end()
+            code_block_ranges.append((start, end))
+            pos = end
+
+        # Step 2: Split text into segments (alternating non-code and code)
+        segments = []
+        last_end = 0
+        for start, end in code_block_ranges:
+            if last_end < start:
+                segments.append(("text", text[last_end:start]))
+            segments.append(("code", text[start:end]))
+            last_end = end
+        if last_end < len(text):
+            segments.append(("text", text[last_end:]))
+
+        # Step 3: Expand each segment into subsegments(each <= max_length)
+        expanded = []
+        for seg_type, seg_text in segments:
+            if len(seg_text) <= max_length:
+                expanded.append((seg_type, seg_text))
+            else:
+                if seg_type == "text":
+                    # split_normal_text already returns chunks ≤ max_length
+                    sub_texts = self._split_normal_text(seg_text, max_length)
+                    for sub in sub_texts:
+                        expanded.append(("text", sub))
+                else:  # code
+                    sub_codes = self._split_code_block(seg_text, max_length)
+                    for sub in sub_codes:
+                        expanded.append(("code", sub))
+
+        # Step 3: Greedily merge consecutive subsegments
+        result_chunks = []
+        current_parts = []
+        current_len = 0
+        for seg_type, seg_text in expanded:
+            seg_len = len(seg_text)
+            if current_len + seg_len <= max_length:
+                current_parts.append(seg_text)
+                current_len += seg_len
+            else:
+                if current_parts:
+                    result_chunks.append("".join(current_parts))
+                current_parts = [seg_text]
+                current_len = seg_len
+        if current_parts:
+            result_chunks.append("".join(current_parts))
+
+        return result_chunks
+
+    def _split_normal_text(self, text: str, max_length: int) -> list[str]:
+        """Split plain text with priority: paragraph, line, space, hard."""
+        if len(text) <= max_length:
+            return [text]
+
+        chunks = []
+        start = 0
+        text_len = len(text)
+
+        while start < text_len:
+            end = min(start + max_length, text_len)
+
+            if end == text_len:
+                chunks.append(text[start:])
+                break
+
+            # 1. Try paragraph break (\n\n)
+            split_at = text.rfind("\n\n", start, end)
+            # Avoid splitting too early (use at least half of the max length)
+            if split_at > start + max_length // 2:
+                chunks.append(text[start:split_at])
+                start = split_at + 2  # skip the two newlines
+                continue
+
+            # 2. Try line break (\n)
+            split_at = text.rfind("\n", start, end)
+            if split_at > start:
+                chunks.append(text[start:split_at])
+                start = split_at + 1
+                continue
+
+            # 3. Try space
+            split_at = text.rfind(" ", start, end)
+            if split_at > start:
+                chunks.append(text[start:split_at])
+                start = split_at + 1
+                continue
+
+            # 4. Hard split (no suitable boundary found)
+            chunks.append(text[start:end])
+            start = end
+
+        return chunks
+
+    def _split_code_block(self, code: str, max_length: int) -> list[str]:
+        """Split a code block into multiple valid code blocks."""
+        lines = code.splitlines(keepends=True)
+        if not lines:
+            return []
+
+        first_line = lines[0]  # e.g. "```python\n" or "```\n"
+        last_line = lines[-1]  # "```"
+        content_lines = lines[1:-1]  # may be empty
+
+        # If the code block has no content, return as is
+        if not content_lines:
+            return [code]
+
+        result = []
+        current_block_lines = []
+        # The fixed overhead: first line + last line
+        overhead = len(first_line) + len(last_line)
+        current_size = overhead
+
+        for line in content_lines:
+            line_len = len(line)
+            if current_size + line_len > max_length:
+                # Current block would exceed limit
+                if current_block_lines:
+                    # Finish current block
+                    block = first_line + "".join(current_block_lines) + last_line
+                    result.append(block)
+                    # Start new block with this line
+                    current_block_lines = [line]
+                    current_size = overhead + line_len
+                else:
+                    # A single line is already too long – hard split the line itself
+                    # We'll split the line into chunks and wrap each with code fences.
+                    # This is an extreme case; we'll handle it by splitting the line
+                    # and making each chunk a separate code block.
+                    remaining = line
+                    while remaining:
+                        # Calculate available space for content
+                        available = max_length - overhead
+                        if available <= 0:
+                            # Overhead alone exceeds limit – impossible, but fallback
+                            # Just return the whole thing (will probably fail)
+                            result.append(code)
+                            break
+
+                        # Take a chunk of the line
+                        chunk = remaining[:available]
+                        result.append(first_line + chunk + last_line)
+                        remaining = remaining[available:]
+                    # Reset for next line
+                    current_block_lines = []
+                    current_size = overhead
+            else:
+                current_block_lines.append(line)
+                current_size += line_len
+
+        # Add the last block
+        if current_block_lines:
+            block = first_line + "".join(current_block_lines) + last_line
+            result.append(block)
+
+        return result
